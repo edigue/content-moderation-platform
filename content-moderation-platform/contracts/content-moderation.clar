@@ -16,6 +16,11 @@
 (define-constant ERR-NO-STAKE-FOUND (err u7))
 (define-constant STAKE_LOCKUP_PERIOD u720)
 (define-constant MIN_STAKE_AMOUNT u1000)
+(define-constant ERR-COOLDOWN-ACTIVE (err u8))
+(define-constant ERR-INVALID-REPORT (err u9))
+(define-constant REPORT_THRESHOLD u3)
+(define-constant COOLDOWN_PERIOD u72)
+(define-constant CHALLENGER_REWARD_PERCENTAGE u5)
 
 ;; Data Maps
 (define-map contents
@@ -50,6 +55,33 @@
         amount: uint,
         locked-until: uint,
         active: bool,
+    }
+)
+
+(define-map content-reports
+    { content-id: uint }
+    {
+        report-count: uint,
+        reporters: (list 10 principal),
+        resolved: bool,
+    }
+)
+
+(define-map user-cooldowns
+    { user: principal }
+    { cooldown-until: uint }
+)
+
+(define-map content-challenges
+    {
+        content-id: uint,
+        challenger: principal,
+    }
+    {
+        stake-amount: uint,
+        challenge-time: uint,
+        resolved: bool,
+        successful: bool,
     }
 )
 
@@ -218,4 +250,171 @@
         })
         (ok true)
     )
+)
+
+;; Report content for violation
+(define-public (report-content (content-id uint))
+    (let (
+            (content (unwrap! (map-get? contents { content-id: content-id })
+                ERR-CONTENT-NOT-FOUND
+            ))
+            (current-reports (default-to {
+                report-count: u0,
+                reporters: (list),
+                resolved: false,
+            }
+                (map-get? content-reports { content-id: content-id })
+            ))
+            (user-cooldown (default-to { cooldown-until: u0 }
+                (map-get? user-cooldowns { user: tx-sender })
+            ))
+        )
+        (asserts! (< stacks-block-height (get cooldown-until user-cooldown))
+            ERR-COOLDOWN-ACTIVE
+        )
+        (asserts! (not (is-eq (get author content) tx-sender)) ERR-INVALID-REPORT)
+
+        ;; Check if user already reported this content
+        (asserts! (is-none (index-of (get reporters current-reports) tx-sender))
+            ERR-INVALID-REPORT
+        )
+
+        (let ((new-reporters (unwrap!
+                (as-max-len? (append (get reporters current-reports) tx-sender)
+                    u10
+                )
+                ERR-INVALID-REPORT
+            )))
+            (map-set content-reports { content-id: content-id } {
+                report-count: (+ (get report-count current-reports) u1),
+                reporters: new-reporters,
+                resolved: false,
+            })
+
+            ;; Set cooldown for reporter
+            (map-set user-cooldowns { user: tx-sender } { cooldown-until: (+ stacks-block-height COOLDOWN_PERIOD) })
+
+            (ok true)
+        )
+    )
+)
+
+;; Challenge a moderation decision
+(define-public (challenge-decision
+        (content-id uint)
+        (stake-amount uint)
+    )
+    (let (
+            (content (unwrap! (map-get? contents { content-id: content-id })
+                ERR-CONTENT-NOT-FOUND
+            ))
+            (challenger-stake (unwrap! (map-get? moderator-stakes { moderator: tx-sender })
+                ERR-NO-STAKE-FOUND
+            ))
+        )
+        (asserts! (>= stake-amount MIN_STAKE_AMOUNT) ERR-INVALID-STAKE)
+        (asserts! (get active challenger-stake) ERR-NOT-AUTHORIZED)
+        (asserts! (not (is-eq (get status content) "pending")) ERR-NOT-AUTHORIZED)
+
+        ;; Transfer challenge stake
+        (try! (stx-transfer? stake-amount tx-sender (as-contract tx-sender)))
+
+        (map-set content-challenges {
+            content-id: content-id,
+            challenger: tx-sender,
+        } {
+            stake-amount: stake-amount,
+            challenge-time: stacks-block-height,
+            resolved: false,
+            successful: false,
+        })
+
+        ;; Reset content to pending for re-evaluation
+        (map-set contents { content-id: content-id }
+            (merge content {
+                status: "pending",
+                voting-ends-at: (+ stacks-block-height VOTING_PERIOD),
+                votes-for: u0,
+                votes-against: u0,
+            })
+        )
+
+        (ok true)
+    )
+)
+
+;; Resolve challenge
+(define-public (resolve-challenge
+        (content-id uint)
+        (challenger principal)
+    )
+    (let (
+            (content (unwrap! (map-get? contents { content-id: content-id })
+                ERR-CONTENT-NOT-FOUND
+            ))
+            (challenge (unwrap!
+                (map-get? content-challenges {
+                    content-id: content-id,
+                    challenger: challenger,
+                })
+                ERR-CONTENT-NOT-FOUND
+            ))
+        )
+        (asserts! (not (get resolved challenge)) ERR-NOT-AUTHORIZED)
+        (asserts! (not (is-voting-period-active content-id)) ERR-NOT-AUTHORIZED)
+
+        (let ((challenge-successful (is-eq (get status content) "rejected")))
+            (map-set content-challenges {
+                content-id: content-id,
+                challenger: challenger,
+            }
+                (merge challenge {
+                    resolved: true,
+                    successful: challenge-successful,
+                })
+            )
+
+            ;; If challenge successful, reward challenger
+            (if challenge-successful
+                (try! (as-contract (stx-transfer?
+                    (/
+                        (* (get stake-amount challenge)
+                            CHALLENGER_REWARD_PERCENTAGE
+                        )
+                        u100
+                    )
+                    tx-sender challenger
+                )))
+                true
+            )
+
+            (ok challenge-successful)
+        )
+    )
+)
+
+;; Read-only function to get moderator stake
+(define-read-only (get-moderator-stake (moderator principal))
+    (map-get? moderator-stakes { moderator: moderator })
+)
+
+;; Read-only function to get content reports
+(define-read-only (get-content-reports (content-id uint))
+    (map-get? content-reports { content-id: content-id })
+)
+
+;; Read-only function to get user cooldown
+(define-read-only (get-user-cooldown (user principal))
+    (map-get? user-cooldowns { user: user })
+)
+
+;; Read-only function to get challenge info
+(define-read-only (get-challenge
+        (content-id uint)
+        (challenger principal)
+    )
+    (map-get? content-challenges {
+        content-id: content-id,
+        challenger: challenger,
+    })
 )
